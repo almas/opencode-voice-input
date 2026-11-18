@@ -38,13 +38,15 @@ interface HeaderProps {
 interface RpcLike {
   start(): Promise<unknown>
   stop(): Promise<unknown>
+  retry(): Promise<unknown>
+  discardTake(): Promise<unknown>
   cancel(): Promise<unknown>
   status(): Promise<unknown>
   prefs(): Promise<unknown>
   setPrefs(input: Partial<Prefs>): Promise<unknown>
 }
 
-const DEFAULT_PREFS: Prefs = { lang: "ja", threads: 24, whisperBin: "whisper-cli", model: "" }
+const DEFAULT_PREFS: Prefs = { lang: "ja", threads: 24, whisperBin: "whisper-cli", model: "", beeps: true }
 
 /** RMS above which we count the meter as "someone is speaking". */
 const SPEAK_THRESHOLD = 0.012
@@ -77,10 +79,77 @@ function formatClock(totalSeconds: number): string {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`
 }
 
+/**
+ * Flatten anything thrown by the SDK into readable text. The client throws
+ * plain objects (ApiError/RpcError shapes), which would otherwise render as
+ * `[object Object]` in toasts and in the app log.
+ */
 function errorText(error: unknown): string {
   if (error instanceof Error && error.message) return error.message
-  if (typeof error === "string") return error
+  if (typeof error === "string" && error) return error
+  if (typeof error === "object" && error !== null) {
+    const e = error as Record<string, unknown>
+    const parts: string[] = []
+    if (typeof e._tag === "string") parts.push(e._tag)
+    else if (typeof e.name === "string" && e.name) parts.push(e.name)
+    if (typeof e.type === "string" && e.type) parts.push(e.type)
+    if (typeof e.message === "string" && e.message && !parts.includes(e.message)) parts.push(e.message)
+    if (typeof e.status === "number" && e.status) parts.push(`HTTP ${e.status}`)
+    if (parts.length) return parts.join(": ").slice(0, 300)
+    try {
+      const json = JSON.stringify(error)
+      if (json && json !== "{}") return json.slice(0, 300)
+    } catch {
+      // circular — fall through
+    }
+  }
   return String(error)
+}
+
+/**
+ * The GUI bundle can mount before the server half of the plugin answers RPC
+ * (a cold service boot registers both halves in sequence), so startup reads
+ * retry with a gentle backoff instead of leaving defaults silently in place.
+ * A service restart plus SDK reconnect can take ~20s, so the schedule covers
+ * roughly 30 seconds before giving up.
+ */
+async function retryRpc<T>(label: string, call: () => Promise<T>, attempts = 10, baseDelayMs = 800): Promise<T | undefined> {
+  for (let attempt = 1; attempt <= attempts; attempt++) {
+    try {
+      return await call()
+    } catch (error) {
+      if (attempt === attempts) {
+        console.error(`[voice-input] ${label} failed: ${errorText(error)}`)
+        return undefined
+      }
+      await new Promise((resolve) => setTimeout(resolve, Math.min(baseDelayMs * attempt, 5000)))
+    }
+  }
+  return undefined
+}
+
+/** Short confirmation tone so recording state is audible, not just visible. */
+function playBeep(kind: "start" | "stop") {
+  try {
+    const AudioCtor: typeof AudioContext =
+      window.AudioContext ?? (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+    if (!AudioCtor) return
+    const audioContext = new AudioCtor()
+    const oscillator = audioContext.createOscillator()
+    const gain = audioContext.createGain()
+    oscillator.type = "sine"
+    oscillator.frequency.value = kind === "start" ? 880 : 523.25
+    gain.gain.setValueAtTime(0.0001, audioContext.currentTime)
+    oscillator.connect(gain)
+    gain.connect(audioContext.destination)
+    oscillator.start()
+    gain.gain.exponentialRampToValueAtTime(0.05, audioContext.currentTime + 0.012)
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioContext.currentTime + 0.1)
+    oscillator.stop(audioContext.currentTime + 0.11)
+    oscillator.onended = () => void audioContext.close().catch(() => {})
+  } catch {
+    // Audio feedback is a nicety; never let it break the recorder.
+  }
 }
 
 export default Plugin.define({
@@ -107,12 +176,24 @@ export default Plugin.define({
       "voice-input.inserted": "Transcription inserted",
       "voice-input.empty": "No speech was recognized",
       "voice-input.error": "Voice input failed",
+      "voice-input.pill.error": "Voice input: last attempt failed",
+      "voice-input.pill.failed": "Voice input: failed — retry",
+      "voice-input.action.retry": "Retry transcribing the kept recording",
+      "voice-input.overlay.failed": "Transcription failed",
+      "voice-input.overlay.failedHint": "The recording is kept — retry once the cause is fixed, or discard it",
+      "voice-input.overlay.retry": "Retry",
+      "voice-input.overlay.dismiss": "Discard",
+      "voice-input.retryFailed": "Retry failed — the recording is still kept",
+      "voice-input.command.copy-last": "Voice Input: copy last transcription",
+      "voice-input.copied": "Transcription copied to clipboard",
+      "voice-input.copy-none": "Nothing to copy yet — record something first",
       "voice-input.no-session": "Open a session to insert dictated text.",
       "voice-input.settings.title": "Voice Input",
       "voice-input.settings.lang": "Recognition language (ISO code, e.g. ja)",
       "voice-input.settings.threads": "whisper threads",
       "voice-input.settings.bin": "whisper-cli path",
       "voice-input.settings.model": "whisper model path",
+      "voice-input.settings.beeps": "Play a short tone when recording starts and stops",
       "voice-input.settings.hint":
         "Records with pw-record and transcribes locally with whisper.cpp. Use a smaller model if transcription feels slow.",
     },
@@ -138,12 +219,24 @@ export default Plugin.define({
       "voice-input.inserted": "文字起こしを挿入しました",
       "voice-input.empty": "音声を認識できませんでした",
       "voice-input.error": "音声入力でエラーが発生しました",
+      "voice-input.pill.error": "音声入力: 直前に失敗",
+      "voice-input.pill.failed": "音声入力: 失敗 — 再試行できます",
+      "voice-input.action.retry": "保持中の録音を再度文字起こし",
+      "voice-input.overlay.failed": "文字起こしに失敗しました",
+      "voice-input.overlay.failedHint": "録音音声は保持されています。原因を解消して再試行するか、閉じると破棄します",
+      "voice-input.overlay.retry": "再試行",
+      "voice-input.overlay.dismiss": "破棄",
+      "voice-input.retryFailed": "再試行も失敗しました — 録音は保持中です",
+      "voice-input.command.copy-last": "音声入力: 直前の文字起こしをコピー",
+      "voice-input.copied": "クリップボードにコピーしました",
+      "voice-input.copy-none": "コピーできる文字起こしはまだありません",
       "voice-input.no-session": "セッションを開くと、文字起こし結果を挿入できます。",
       "voice-input.settings.title": "音声入力",
       "voice-input.settings.lang": "認識言語（ISOコード、例: ja）",
       "voice-input.settings.threads": "whisperスレッド数",
       "voice-input.settings.bin": "whisper-cliのパス",
       "voice-input.settings.model": "whisperモデルのパス",
+      "voice-input.settings.beeps": "録音の開始・終了時に短い音を鳴らす",
       "voice-input.settings.hint":
         "pw-recordで録音し、whisper.cppでローカルに文字起こしします。処理が遅い場合は小さいモデルに変更してください。",
     },
@@ -155,10 +248,9 @@ export default Plugin.define({
 
     // ---------- preferences ----------
     const [prefs, setPrefs] = createSignal<Prefs>({ ...DEFAULT_PREFS })
-    void rpc
-      .prefs()
-      .then((value) => setPrefs(value as Prefs))
-      .catch((error) => console.error("[voice-input] prefs", error))
+    void retryRpc("prefs", () => rpc.prefs()).then((value) => {
+      if (value) setPrefs(value as Prefs)
+    })
 
     const savePrefs = async (patch: Partial<Prefs>) => {
       const next = { ...prefs(), ...patch }
@@ -166,34 +258,45 @@ export default Plugin.define({
       try {
         setPrefs((await rpc.setPrefs(next)) as Prefs)
       } catch (error) {
-        console.error("[voice-input] setPrefs", error)
+        console.error(`[voice-input] setPrefs failed: ${errorText(error)}`)
         ctx.toast.show({ title: ctx.t("voice-input.error"), description: errorText(error), variant: "error" })
       }
     }
 
     // ---------- recorder state ----------
-    const [state, setState] = createSignal<"idle" | "recording" | "busy">("idle")
+    const [state, setState] = createSignal<"idle" | "recording" | "busy" | "failed">("idle")
     const [elapsed, setElapsed] = createSignal(0)
+    const [lastError, setLastError] = createSignal<string>()
     const ticker = setInterval(() => {
-      if (state() !== "recording") return
+      if (state() !== "recording" || finishing) return
       void rpc
         .status()
         .then((value) => {
           const status = value as StatusResult
+          if (!status.recording && !finishing) {
+            // The take ended elsewhere (another window, or the recorder died): reflect it here.
+            setState("idle")
+            setElapsed(0)
+            stopMeter()
+            if (status.lastError) setLastError(status.lastError)
+            return
+          }
           setElapsed(status.recording ? Math.floor(status.seconds) : 0)
         })
         .catch(() => {})
     }, 1000)
     onCleanup(() => clearInterval(ticker))
 
-    // Resync a freshly loaded window with a recorder another window started.
-    void rpc
-      .status()
-      .then((value) => {
-        const status = value as StatusResult
-        if (status.recording) setState("recording")
-      })
-      .catch(() => {})
+    // Resync a freshly loaded window with a recorder another window started, and
+    // surface any earlier failure — retries because the RPC side may boot after the GUI.
+    void retryRpc("status", () => rpc.status()).then((value) => {
+      if (!value) return
+      const status = value as StatusResult
+      if (status.recording && state() === "idle") setState("recording")
+      // A take whose transcription failed is kept on disk: reopen the retry prompt.
+      else if (!status.recording && status.hasLastTake && state() === "idle") setState("failed")
+      if (status.lastError) setLastError(status.lastError)
+    })
 
     // ---------- live level meter (client-side, optional) ----------
     const [level, setLevel] = createSignal(0)
@@ -217,7 +320,7 @@ export default Plugin.define({
           audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
         })
       } catch (error) {
-        console.warn("[voice-input] mic level meter unavailable", error)
+        console.warn(`[voice-input] mic level meter unavailable: ${errorText(error)}`)
         setMeterAvailable(false)
         return
       }
@@ -283,10 +386,32 @@ export default Plugin.define({
     })
 
     // ---------- actions ----------
-    const insert = (text: string) => {
+    let lastTranscript = ""
+
+    const copyToClipboard = async (text: string): Promise<boolean> => {
+      try {
+        await navigator.clipboard.writeText(text)
+        return true
+      } catch (error) {
+        console.error(`[voice-input] clipboard failed: ${errorText(error)}`)
+        return false
+      }
+    }
+
+    const insert = async (text: string) => {
+      lastTranscript = text
       const screen = ctx.screen.current()
       if (!screen) {
-        ctx.toast.show({ title: ctx.t("voice-input.no-session"), variant: "default" })
+        // Never lose a take: with no open composer the text goes to the clipboard instead.
+        if (await copyToClipboard(text)) {
+          ctx.toast.show({
+            title: ctx.t("voice-input.no-session"),
+            description: ctx.t("voice-input.copied"),
+            variant: "default",
+          })
+        } else {
+          ctx.toast.show({ title: ctx.t("voice-input.no-session"), variant: "default" })
+        }
         return
       }
       const existing = screen.composer.text()
@@ -300,9 +425,11 @@ export default Plugin.define({
 
     const startRecording = async () => {
       if (state() !== "idle") return
+      if (prefs().beeps) playBeep("start")
       try {
         const result = (await rpc.start()) as StartResult
         if (result.recording) {
+          setLastError(undefined)
           setState("recording")
           setElapsed(0)
           void startMeter(
@@ -325,20 +452,88 @@ export default Plugin.define({
 
     const stopAndTranscribe = async () => {
       if (state() !== "recording" || finishing) return
+      if (prefs().beeps) playBeep("stop")
       finishing = true
       stopMeter()
       setState("busy")
       try {
-        const result = (await rpc.stop()) as StopResult
+        // A lost reply (service restart mid-take) must not lose the take: the
+        // server keeps the audio either way, so retry the call before giving up.
+        const result = (await retryRpc("stop", () => rpc.stop(), 4, 1200)) as StopResult | undefined
+        if (!result) throw new Error(ctx.t("voice-input.error"))
         const text = result.text.trim()
-        if (text) insert(text)
-        else ctx.toast.show({ title: ctx.t("voice-input.empty"), variant: "default" })
+        if (text) {
+          setLastError(undefined)
+          await insert(text)
+        } else {
+          // Empty text is either a retryable failure (audio kept) or a silent take.
+          const info = (await rpc.status().catch(() => undefined)) as StatusResult | undefined
+          if (info?.lastError) setLastError(info.lastError)
+          if (info?.hasLastTake) setState("failed")
+          else {
+            const notice = info?.lastError || ctx.t("voice-input.empty")
+            setLastError(notice)
+            ctx.toast.show({ title: notice, variant: "default" })
+          }
+        }
       } catch (error) {
-        ctx.toast.show({ title: ctx.t("voice-input.error"), description: errorText(error), variant: "error" })
+        // Transport failed with the take still on disk — show 再試行, never cancel.
+        const message = errorText(error)
+        setLastError(message)
+        setState("failed")
       } finally {
         finishing = false
-        setState("idle")
+        if (state() === "busy") setState("idle")
         setElapsed(0)
+      }
+    }
+
+    /** Re-transcribe the kept-over take from the failed state. */
+    const retryFromFailure = async () => {
+      if (finishing) return
+      finishing = true
+      setState("busy")
+      let delegated = false
+      try {
+        const info = (await retryRpc("status", () => rpc.status(), 4, 1200)) as StatusResult | undefined
+        if (info?.recording) {
+          // The recorder is actually still running: finish that take instead.
+          delegated = true
+          finishing = false
+          setState("recording")
+          void stopAndTranscribe()
+          return
+        }
+        const result = (await retryRpc("retry", () => rpc.retry(), 4, 1200)) as StopResult | undefined
+        const text = result?.text.trim() ?? ""
+        if (text) {
+          setLastError(undefined)
+          await insert(text)
+          setState("idle")
+        } else {
+          const fresh = (await rpc.status().catch(() => undefined)) as StatusResult | undefined
+          if (fresh?.lastError) setLastError(fresh.lastError)
+          ctx.toast.show({ title: ctx.t("voice-input.retryFailed"), variant: "error" })
+          setState("failed")
+        }
+      } catch (error) {
+        setLastError(errorText(error))
+        setState("failed")
+      } finally {
+        finishing = false
+        if (!delegated && state() === "busy") setState("failed")
+      }
+    }
+
+    /** Acknowledge the failure: drop the kept audio and return to idle. */
+    const dismissFailure = async () => {
+      setState("idle")
+      setElapsed(0)
+      setLastError(undefined)
+      try {
+        await rpc.discardTake()
+      } catch (error) {
+        console.error(`[voice-input] discardTake failed: ${errorText(error)}`)
       }
     }
 
@@ -351,14 +546,28 @@ export default Plugin.define({
       try {
         await rpc.cancel()
       } catch (error) {
-        console.error("[voice-input] cancel", error)
+        console.error(`[voice-input] cancel failed: ${errorText(error)}`)
       }
       if (notice) ctx.toast.show({ title: notice, variant: "default" })
+    }
+
+    /** Re-copy the last take — useful when the insert landed nowhere useful. */
+    const copyLast = async () => {
+      if (!lastTranscript) {
+        ctx.toast.show({ title: ctx.t("voice-input.copy-none"), variant: "default" })
+        return
+      }
+      if (await copyToClipboard(lastTranscript)) {
+        ctx.toast.show({ title: ctx.t("voice-input.copied"), description: lastTranscript.slice(0, 60), variant: "success" })
+      } else {
+        ctx.toast.show({ title: ctx.t("voice-input.error"), variant: "error" })
+      }
     }
 
     const toggle = () => {
       if (state() === "idle") void startRecording()
       else if (state() === "recording") void stopAndTranscribe()
+      else if (state() === "failed") void retryFromFailure()
     }
 
     // ---------- keyboard ----------
@@ -366,7 +575,8 @@ export default Plugin.define({
       const onKeyDown = (event: KeyboardEvent) => {
         if (event.key !== "Escape" || state() === "idle") return
         event.stopPropagation()
-        void cancelRecording()
+        if (state() === "failed") void dismissFailure()
+        else void cancelRecording()
       }
       window.addEventListener("keydown", onKeyDown, { capture: true })
       onCleanup(() => window.removeEventListener("keydown", onKeyDown, { capture: true }))
@@ -390,6 +600,15 @@ export default Plugin.define({
       },
       section: "prompt",
       run: () => void cancelRecording(),
+    })
+    ctx.add(Command, {
+      id: "voice-input.copy-last",
+      get title() {
+        return ctx.t("voice-input.command.copy-last")
+      },
+      keywords: "voice dictation clipboard copy transcript",
+      section: "prompt",
+      run: () => void copyLast(),
     })
 
     // ---------- composer pill: always-visible state ----------
@@ -415,6 +634,25 @@ export default Plugin.define({
             title: ctx.t("voice-input.action.busy"),
           }
         }
+        if (current === "failed") {
+          return {
+            icon: "refresh" as const,
+            tone: "danger" as const,
+            label: ctx.t("voice-input.pill.failed"),
+            title: lastError() || ctx.t("voice-input.action.retry"),
+            run: toggle,
+          }
+        }
+        const failure = lastError()
+        if (failure) {
+          return {
+            icon: "outline-wave-audio" as const,
+            tone: "warning" as const,
+            label: ctx.t("voice-input.pill.error"),
+            title: failure,
+            run: toggle,
+          }
+        }
         return {
           icon: "outline-wave-audio" as const,
           label: ctx.t("voice-input.pill.idle"),
@@ -437,7 +675,9 @@ export default Plugin.define({
                 ? `${ctx.t("voice-input.action.stop")} ${formatClock(elapsed())}`
                 : state() === "busy"
                   ? ctx.t("voice-input.action.busy")
-                  : ctx.t("voice-input.action.start")
+                  : state() === "failed"
+                    ? ctx.t("voice-input.action.retry")
+                    : ctx.t("voice-input.action.start")
             }
             aria-label={ctx.t("voice-input.action.start")}
             onClick={toggle}
@@ -451,11 +691,19 @@ export default Plugin.define({
               border: "none",
               "border-radius": "4px",
               cursor: "pointer",
-              color: state() === "recording" ? "#e5484d" : "inherit",
+              color: state() === "recording" || state() === "failed" ? "#e5484d" : "inherit",
             }}
           >
             <Icon
-              name={state() === "busy" ? "refresh" : state() === "recording" ? "stop" : "outline-wave-audio"}
+              name={
+                state() === "failed"
+                  ? "refresh"
+                  : state() === "busy"
+                    ? "refresh"
+                    : state() === "recording"
+                      ? "stop"
+                      : "outline-wave-audio"
+              }
               size="small"
             />
           </button>
@@ -561,6 +809,12 @@ export default Plugin.define({
                     </span>
                     <span style={{ "font-weight": "600" }}>{ctx.t("voice-input.overlay.transcribing")}</span>
                   </Show>
+                  <Show when={state() === "failed"}>
+                    <span style={{ display: "inline-flex", color: "#e5484d" }}>
+                      <Icon name="close-small" size="normal" />
+                    </span>
+                    <span style={{ "font-weight": "600", color: "#e5484d" }}>{ctx.t("voice-input.overlay.failed")}</span>
+                  </Show>
                 </div>
                 <Show when={state() === "recording"}>
                   <div style={{ display: "flex", gap: "8px" }}>
@@ -584,6 +838,29 @@ export default Plugin.define({
                       <Show when={!meterAvailable()}> · {ctx.t("voice-input.overlay.noMeter")}</Show>
                     </Show>
                   </div>
+                </Show>
+                <Show when={state() === "failed"}>
+                  <Show when={lastError()}>
+                    <div style={{ color: "#e5484d", "white-space": "pre-wrap", "max-width": "460px", "font-size": "12px" }}>
+                      {lastError()}
+                    </div>
+                  </Show>
+                  <div style={{ display: "flex", gap: "8px" }}>
+                    <button
+                      type="button"
+                      onClick={() => void retryFromFailure()}
+                      style={{ ...buttonStyle, background: "#e5484d", color: "#fff", border: "none" }}
+                    >
+                      <Icon name="refresh" size="small" />
+                      {ctx.t("voice-input.overlay.retry")}
+                    </button>
+                    <button type="button" onClick={() => void dismissFailure()} style={buttonStyle}>
+                      <Icon name="close-small" size="small" />
+                      {ctx.t("voice-input.overlay.dismiss")}
+                      <span style={{ opacity: "0.55" }}>Esc</span>
+                    </button>
+                  </div>
+                  <div style={{ opacity: "0.65" }}>{ctx.t("voice-input.overlay.failedHint")}</div>
                 </Show>
               </div>
             </div>
@@ -653,6 +930,14 @@ export default Plugin.define({
               onChange={(event) => void savePrefs({ model: event.currentTarget.value })}
               style={fieldStyle}
             />
+          </label>
+          <label style={{ display: "flex", gap: "8px", "align-items": "center" }}>
+            <input
+              type="checkbox"
+              checked={prefs().beeps}
+              onChange={(event) => void savePrefs({ beeps: event.currentTarget.checked })}
+            />
+            <span>{ctx.t("voice-input.settings.beeps")}</span>
           </label>
           <span style={{ opacity: "0.65" }}>{ctx.t("voice-input.settings.hint")}</span>
         </div>

@@ -33,6 +33,27 @@ export const VoiceInputRpc = {
         required: ["text"],
       },
     },
+    // Re-transcribe the take whose previous transcription failed.
+    retry: {
+      input: { type: "object", properties: {} },
+      output: {
+        type: "object",
+        properties: {
+          text: { type: "string" },
+          seconds: { type: "number" },
+        },
+        required: ["text"],
+      },
+    },
+    // Drop the kept-over failed take without retrying.
+    discardTake: {
+      input: { type: "object", properties: {} },
+      output: {
+        type: "object",
+        properties: { discarded: { type: "boolean" } },
+        required: ["discarded"],
+      },
+    },
     // Stop recording and throw the audio away.
     cancel: {
       input: { type: "object", properties: {} },
@@ -51,6 +72,7 @@ export const VoiceInputRpc = {
           recording: { type: "boolean" },
           seconds: { type: "number" },
           lastError: { type: "string" },
+          hasLastTake: { type: "boolean" },
         },
         required: ["recording"],
       },
@@ -65,8 +87,9 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          beeps: { type: "boolean" },
         },
-        required: ["lang", "threads", "whisperBin", "model"],
+        required: ["lang", "threads", "whisperBin", "model", "beeps"],
       },
     },
     setPrefs: {
@@ -77,6 +100,7 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          beeps: { type: "boolean" },
         },
       },
       output: {
@@ -86,15 +110,16 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          beeps: { type: "boolean" },
         },
-        required: ["lang", "threads", "whisperBin", "model"],
+        required: ["lang", "threads", "whisperBin", "model", "beeps"],
       },
     },
   },
   events: {},
 } satisfies Rpc.PortableDefinition
 
-export type Prefs = { lang: string; threads: number; whisperBin: string; model: string }
+export type Prefs = { lang: string; threads: number; whisperBin: string; model: string; beeps: boolean }
 export type StartResult = { recording: boolean; startedAt: number }
 export type StopResult = { text: string; seconds: number }
-export type StatusResult = { recording: boolean; seconds: number; lastError: string }
+export type StatusResult = { recording: boolean; seconds: number; lastError: string; hasLastTake: boolean }

@@ -36,14 +36,14 @@ interface HeaderProps {
 }
 
 interface RpcLike {
-  start(): Promise<unknown>
-  stop(): Promise<unknown>
-  retry(): Promise<unknown>
-  discardTake(): Promise<unknown>
-  cancel(): Promise<unknown>
-  status(): Promise<unknown>
-  sources(): Promise<unknown>
-  prefs(): Promise<unknown>
+  start(input?: object): Promise<unknown>
+  stop(input?: object): Promise<unknown>
+  retry(input?: object): Promise<unknown>
+  discardTake(input?: object): Promise<unknown>
+  cancel(input?: object): Promise<unknown>
+  status(input?: object): Promise<unknown>
+  sources(input?: object): Promise<unknown>
+  prefs(input?: object): Promise<unknown>
   setPrefs(input: Partial<Prefs>): Promise<unknown>
 }
 
@@ -259,7 +259,7 @@ export default Plugin.define({
 
     // ---------- preferences ----------
     const [prefs, setPrefs] = createSignal<Prefs>({ ...DEFAULT_PREFS })
-    void retryRpc("prefs", () => rpc.prefs()).then((value) => {
+    void retryRpc("prefs", () => rpc.prefs({})).then((value) => {
       if (value) setPrefs(value as Prefs)
     })
 
@@ -300,7 +300,7 @@ export default Plugin.define({
 
     // Resync a freshly loaded window with a recorder another window started, and
     // surface any earlier failure — retries because the RPC side may boot after the GUI.
-    void retryRpc("status", () => rpc.status()).then((value) => {
+    void retryRpc("status", () => rpc.status({})).then((value) => {
       if (!value) return
       const status = value as StatusResult
       if (status.recording && state() === "idle") setState("recording")
@@ -335,7 +335,7 @@ export default Plugin.define({
       if (wanted !== "") {
         try {
           const [sourceList, devices] = await Promise.all([
-            rpc.sources() as Promise<SourcesResult>,
+            rpc.sources({}) as Promise<SourcesResult>,
             navigator.mediaDevices.enumerateDevices(),
           ])
           const info = sourceList.sources.find((entry) => entry.name === wanted)
@@ -473,7 +473,7 @@ export default Plugin.define({
       if (state() !== "idle") return
       if (prefs().beeps) playBeep("start")
       try {
-        const result = (await rpc.start()) as StartResult
+        const result = (await rpc.start({})) as StartResult
         if (result.recording) {
           setLastError(undefined)
           setState("recording")
@@ -505,7 +505,7 @@ export default Plugin.define({
       try {
         // A lost reply (service restart mid-take) must not lose the take: the
         // server keeps the audio either way, so retry the call before giving up.
-        const result = (await retryRpc("stop", () => rpc.stop(), 4, 1200)) as StopResult | undefined
+        const result = (await retryRpc("stop", () => rpc.stop({}), 4, 1200)) as StopResult | undefined
         if (!result) throw new Error(ctx.t("voice-input.error"))
         const text = result.text.trim()
         if (text) {
@@ -513,7 +513,7 @@ export default Plugin.define({
           await insert(text)
         } else {
           // Empty text is either a retryable failure (audio kept) or a silent take.
-          const info = (await rpc.status().catch(() => undefined)) as StatusResult | undefined
+          const info = (await rpc.status({}).catch(() => undefined)) as StatusResult | undefined
           if (info?.lastError) setLastError(info.lastError)
           if (info?.hasLastTake) setState("failed")
           else {
@@ -541,7 +541,7 @@ export default Plugin.define({
       setState("busy")
       let delegated = false
       try {
-        const info = (await retryRpc("status", () => rpc.status(), 4, 1200)) as StatusResult | undefined
+        const info = (await retryRpc("status", () => rpc.status({}), 4, 1200)) as StatusResult | undefined
         if (info?.recording) {
           // The recorder is actually still running: finish that take instead.
           delegated = true
@@ -550,14 +550,14 @@ export default Plugin.define({
           void stopAndTranscribe()
           return
         }
-        const result = (await retryRpc("retry", () => rpc.retry(), 4, 1200)) as StopResult | undefined
+        const result = (await retryRpc("retry", () => rpc.retry({}), 4, 1200)) as StopResult | undefined
         const text = result?.text.trim() ?? ""
         if (text) {
           setLastError(undefined)
           await insert(text)
           setState("idle")
         } else {
-          const fresh = (await rpc.status().catch(() => undefined)) as StatusResult | undefined
+          const fresh = (await rpc.status({}).catch(() => undefined)) as StatusResult | undefined
           if (fresh?.lastError) setLastError(fresh.lastError)
           ctx.toast.show({ title: ctx.t("voice-input.retryFailed"), variant: "error" })
           setState("failed")
@@ -577,7 +577,7 @@ export default Plugin.define({
       setElapsed(0)
       setLastError(undefined)
       try {
-        await rpc.discardTake()
+        await rpc.discardTake({})
       } catch (error) {
         console.error(`[voice-input] discardTake failed: ${errorText(error)}`)
       }
@@ -590,7 +590,7 @@ export default Plugin.define({
       setElapsed(0)
       if (!wasRecording) return
       try {
-        await rpc.cancel()
+        await rpc.cancel({})
       } catch (error) {
         console.error(`[voice-input] cancel failed: ${errorText(error)}`)
       }

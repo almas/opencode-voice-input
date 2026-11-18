@@ -18,7 +18,7 @@ import { VoiceInputRpc, type Prefs, type SourceInfo, type SourcesResult, type St
 const PREFS_KEY = "voice-input/prefs"
 const MAX_RECORD_SECONDS = 300
 /** 16 kHz mono s16 is 32 kB/s; anything under ~0.25 s captured nothing usable. */
-const MIN_AUDIO_BYTES = 8000
+export const MIN_AUDIO_BYTES = 8000
 
 const LOCAL = join(homedir(), ".local")
 const LIB_DIR = join(LOCAL, "usr/lib/x86_64-linux-gnu")
@@ -28,7 +28,7 @@ function defaultWhisperBin(): string {
   return existsSync(local) ? local : "whisper-cli"
 }
 
-const DEFAULT_PREFS: Prefs = {
+export const DEFAULT_PREFS: Prefs = {
   lang: "ja",
   threads: 24,
   whisperBin: defaultWhisperBin(),
@@ -45,26 +45,26 @@ function runCommand(command: string, args: string[]): Promise<string> {
   })
 }
 
-function loadPrefsValue(value: unknown, fallback: string): string {
+export function loadPrefsValue(value: unknown, fallback: string): string {
   return typeof value === "string" && value.trim() ? value.trim() : fallback
 }
 
-function loadPrefsNumber(value: unknown, fallback: number): number {
+export function loadPrefsNumber(value: unknown, fallback: number): number {
   const n = typeof value === "number" && Number.isFinite(value) ? value : fallback
   return Math.max(1, Math.min(128, Math.round(n)))
 }
 
-function loadLang(value: unknown, fallback: string): string {
+export function loadLang(value: unknown, fallback: string): string {
   const lang = loadPrefsValue(value, fallback)
   return /^(auto|[a-z]{2}(-[A-Za-z]{2})?)$/.test(lang) ? lang : fallback
 }
 
-function loadPrefsBoolean(value: unknown, fallback: boolean): boolean {
+export function loadPrefsBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback
 }
 
 /** Empty is meaningful here: "use the system default source". */
-function loadPrefsSource(value: unknown, fallback: string): string {
+export function loadPrefsSource(value: unknown, fallback: string): string {
   return typeof value === "string" ? value.trim() : fallback
 }
 
@@ -151,10 +151,15 @@ const SILENCE_HALLUCINATION_RE =
 /** Bracketed non-speech markers whisper invents: 【音楽】（拍手）[Applause]. */
 const NON_SPEECH_MARKER = /[【[(（［][^】\])］（）()]{0,16}[】\])）］]/g
 
-function stripSilenceHallucinations(text: string): string {
+export function stripSilenceHallucinations(text: string): string {
   const out = text.replace(SILENCE_HALLUCINATION_RE, "").replace(NON_SPEECH_MARKER, "")
-  // Orphaned punctuation left behind by the removals.
-  return out.replace(/^[\s。、．!！？?,;:]+|[\s。、．!！？?,;:]+$/g, "").replace(/\s+/g, " ").trim()
+  // Leading orphans go entirely; a trailing run collapses to one character so
+  // a real sentence-ending "。" survives while leftovers like "。、" shrink.
+  return out
+    .replace(/^[\s。、．!！？?,;:]+/, "")
+    .replace(/[。、．!！？?,;:]{2,}$/, "$1")
+    .replace(/\s+/g, " ")
+    .trim()
 }
 
 function transcribe(wav: string, prefs: Prefs): Promise<string> {

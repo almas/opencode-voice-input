@@ -61,6 +61,17 @@ const MIN_TAKE_MS = 4000
 
 const EQUALIZER_WEIGHTS = [0.5, 0.9, 0.65, 1, 0.75, 0.95, 0.6, 0.85, 0.45]
 
+/** Microphone glyph shared by the composer button and the header button. */
+const MIC_SVG =
+  '<svg viewBox="0 0 14 14" fill="none" aria-hidden="true">' +
+  '<path d="M7 8.75a2.5 2.5 0 0 0 2.5-2.5V3a2.5 2.5 0 1 0-5 0v3.25A2.5 2.5 0 0 0 7 8.75Z" stroke="currentColor" stroke-width="1.1"/>' +
+  '<path d="M3.4 6.5v.25a3.6 3.6 0 0 0 7.2 0V6.5M7 10.35v1.4M5.1 11.95h3.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>' +
+  "</svg>"
+
+/** Stop square shown while a take is recording. */
+const STOP_SVG =
+  '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M13 3H3V13H13V3Z" fill="currentColor"/></svg>'
+
 const STYLE_ID = "voice-input-style"
 
 function injectStyles() {
@@ -73,7 +84,7 @@ function injectStyles() {
 @keyframes vi-eq { 0%, 100% { transform: scaleY(0.25) } 50% { transform: scaleY(1) } }
 .vi-eq-bar { transform-origin: bottom; animation: vi-eq 900ms ease-in-out infinite }
 @keyframes vi-mic-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.35 } }
-button[data-oc-voice-mic="1"] svg { width: 16px; height: 16px }
+button[data-oc-voice-mic="1"] svg, .vi-header-icon svg { width: 16px; height: 16px }
 button[data-oc-voice-mic="1"][data-recording="1"] { animation: vi-mic-pulse 1.2s ease-in-out infinite; color: #e5484d }
 `
   document.head.appendChild(style)
@@ -674,13 +685,8 @@ export default Plugin.define({
     // for its per-message buttons. It copies the submit button's own classes,
     // so it matches both the tall and the compact composer footers, and shows
     // a red stop square (pulsing) while recording.
-    const MIC_SVG =
-      '<svg viewBox="0 0 14 14" fill="none" aria-hidden="true">' +
-      '<path d="M7 8.75a2.5 2.5 0 0 0 2.5-2.5V3a2.5 2.5 0 1 0-5 0v3.25A2.5 2.5 0 0 0 7 8.75Z" stroke="currentColor" stroke-width="1.1"/>' +
-      '<path d="M3.4 6.5v.25a3.6 3.6 0 0 0 7.2 0V6.5M7 10.35v1.4M5.1 11.95h3.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>' +
-      "</svg>"
-    const STOP_SVG = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M13 3H3V13H13V3Z" fill="currentColor"/></svg>'
-
+    // The microphone glyph is the module-level MIC_SVG, shared with the
+    // header button so both controls look identical.
     onMount(() => {
       const syncMic = () => {
         for (const submit of Array.from(
@@ -787,18 +793,12 @@ export default Plugin.define({
               color: state() === "recording" || state() === "failed" ? "#e5484d" : "inherit",
             }}
           >
-            <Icon
-              name={
-                state() === "failed"
-                  ? "refresh"
-                  : state() === "busy"
-                    ? "refresh"
-                    : state() === "recording"
-                      ? "stop"
-                      : "outline-wave-audio"
-              }
-              size="small"
-            />
+            <Show
+              when={state() === "busy" || state() === "failed"}
+              fallback={<span class="vi-header-icon" innerHTML={state() === "recording" ? STOP_SVG : MIC_SVG} />}
+            >
+              <Icon name="refresh" size="small" />
+            </Show>
           </button>
         </Show>
       ),

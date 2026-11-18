@@ -6,13 +6,14 @@
  * (whisper.cpp) and returns the text, which the GUI inserts into the composer.
  * Recording state lives here, so every GUI window sees the same recorder.
  */
+import { execFile } from "node:child_process"
 import { spawn, type ChildProcessByStdio } from "node:child_process"
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { Readable } from "node:stream"
 import { Plugin } from "@opencode/plugin"
-import { VoiceInputRpc, type Prefs, type StartResult, type StatusResult, type StopResult } from "./rpc"
+import { VoiceInputRpc, type Prefs, type SourceInfo, type SourcesResult, type StartResult, type StatusResult, type StopResult } from "./rpc"
 
 const PREFS_KEY = "voice-input/prefs"
 const MAX_RECORD_SECONDS = 300
@@ -32,7 +33,16 @@ const DEFAULT_PREFS: Prefs = {
   threads: 24,
   whisperBin: defaultWhisperBin(),
   model: join(LOCAL, "share/whisper-models/ggml-large-v3-turbo.bin"),
+  source: "",
   beeps: true,
+}
+
+function runCommand(command: string, args: string[]): Promise<string> {
+  return new Promise((resolve) => {
+    execFile(command, args, { timeout: 5000, maxBuffer: 4 * 1024 * 1024 }, (error, stdout) => {
+      resolve(error ? "" : stdout)
+    })
+  })
 }
 
 function loadPrefsValue(value: unknown, fallback: string): string {
@@ -51,6 +61,11 @@ function loadLang(value: unknown, fallback: string): string {
 
 function loadPrefsBoolean(value: unknown, fallback: boolean): boolean {
   return typeof value === "boolean" ? value : fallback
+}
+
+/** Empty is meaningful here: "use the system default source". */
+function loadPrefsSource(value: unknown, fallback: string): string {
+  return typeof value === "string" ? value.trim() : fallback
 }
 
 interface Active {
@@ -131,7 +146,7 @@ function discard(rec: Active): void {
  * a polite sentence the user never said.
  */
 const SILENCE_HALLUCINATION_RE =
-  /(ご視聴(?:いただき)?ありがとうございました|ご清聴ありがとうございました|字幕ご協力ありがとうございました|日本語の字幕を確認しました|thanks?\s+for\s+watching!?)/gi
+  /(ご視聴(?:いただき)?ありがとうございました|ご清聴ありがとうございました|字幕ご協力ありがとうございました|日本語の字幕を確認しました|チャンネル登録(?:を)?(?:お願いします|よろしくお願いします)?|thanks?\s+for\s+watching!?)/gi
 
 /** Bracketed non-speech markers whisper invents: 【音楽】（拍手）[Applause]. */
 const NON_SPEECH_MARKER = /[【[(（［][^】\])］（）()]{0,16}[】\])）］]/g
@@ -191,6 +206,7 @@ export default Plugin.define({
           threads: loadPrefsNumber(stored.threads, DEFAULT_PREFS.threads),
           whisperBin: loadPrefsValue(stored.whisperBin, DEFAULT_PREFS.whisperBin),
           model: loadPrefsValue(stored.model, DEFAULT_PREFS.model),
+          source: loadPrefsSource(stored.source, DEFAULT_PREFS.source),
           beeps: loadPrefsBoolean(stored.beeps, DEFAULT_PREFS.beeps),
         }
       } catch {
@@ -205,11 +221,23 @@ export default Plugin.define({
         discardDirOf(lastTake.file)
         lastTake = undefined
       }
+      const source = (await load()).source
       const dir = mkdtempSync(join(tmpdir(), "opencode-voice-input-"))
       const file = join(dir, "take.wav")
       const child = spawn(
         "pw-record",
-        ["--rate", "16000", "--channels", "1", "--format", "s16", "--latency", "50ms", file],
+        [
+          "--rate",
+          "16000",
+          "--channels",
+          "1",
+          "--format",
+          "s16",
+          "--latency",
+          "50ms",
+          ...(source ? ["--target", source] : []),
+          file,
+        ],
         { stdio: ["ignore", "ignore", "pipe"] },
       )
       let spawnError: string | undefined
@@ -226,8 +254,12 @@ export default Plugin.define({
           if (active === rec && !rec.stopping) {
             rec.stopping = true
             active = undefined
-            lastError = `上限の${MAX_RECORD_SECONDS}秒に達したため録音を停止しました`
-            void terminate(rec).then(() => discard(rec))
+            void terminate(rec).then(() => {
+              // Keep the long take instead of losing it: the GUI offers 再試行.
+              if (lastTake) discardDirOf(lastTake.file)
+              lastTake = { file: rec.file, seconds: MAX_RECORD_SECONDS }
+              lastError = `上限の${MAX_RECORD_SECONDS}秒に達したため録音を停止しました。再試行で文字起こしできます。`
+            })
           }
         }, MAX_RECORD_SECONDS * 1000),
       }
@@ -327,12 +359,51 @@ export default Plugin.define({
       return { cancelled: true }
     }
 
+    /** List PipeWire capture sources so the settings page can offer a picker. */
+    const listSources = async (): Promise<SourcesResult> => {
+      const [dump, meta] = await Promise.all([
+        runCommand("pw-dump", []),
+        runCommand("pw-metadata", ["-n", "default"]),
+      ])
+      let defaultName = ""
+      const match = meta.match(/default\.audio\.source'\s+value:'(\{[^']*\})'/)
+      const payload = match?.[1]
+      if (payload) {
+        try {
+          const parsed = JSON.parse(payload) as { name?: unknown }
+          if (typeof parsed.name === "string") defaultName = parsed.name
+        } catch {}
+      }
+      if (!dump) return { sources: [] }
+      try {
+        const nodes = JSON.parse(dump) as Array<Record<string, any>>
+        const sources: SourceInfo[] = []
+        for (const node of nodes) {
+          const props = (node?.info?.props ?? {}) as Record<string, any>
+          if (props["media.class"] !== "Audio/Source") continue
+          const name = String(props["node.name"] ?? "")
+          const id = Number(node?.id ?? 0)
+          if (!name || !Number.isFinite(id) || id <= 0) continue
+          sources.push({
+            id,
+            name,
+            description: String(props["node.description"] ?? props["node.nick"] ?? name),
+            default: name === defaultName,
+          })
+        }
+        return { sources }
+      } catch {
+        return { sources: [] }
+      }
+    }
+
     await ctx.rpc.register(VoiceInputRpc, {
       start,
       stop,
       retry,
       discardTake,
       cancel,
+      sources: listSources,
       status: async (): Promise<StatusResult> => ({
         recording: active !== undefined,
         seconds: active ? (Date.now() - active.startedAt) / 1000 : 0,
@@ -348,6 +419,7 @@ export default Plugin.define({
           threads: input.threads === undefined ? current.threads : loadPrefsNumber(input.threads, current.threads),
           whisperBin: input.whisperBin === undefined ? current.whisperBin : loadPrefsValue(input.whisperBin, current.whisperBin),
           model: input.model === undefined ? current.model : loadPrefsValue(input.model, current.model),
+          source: input.source === undefined ? current.source : loadPrefsSource(input.source, current.source),
           beeps: input.beeps === undefined ? current.beeps : loadPrefsBoolean(input.beeps, current.beeps),
         }
         await ctx.storage.set(PREFS_KEY, { ...next })

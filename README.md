@@ -13,9 +13,10 @@ Local speech-to-text for **OpenCode Desktop**: click the microphone (composer pi
 - **PipeWire capture** via `pw-record --rate 16000 --channels 1 --format s16`, stopped with SIGINT/SIGTERM.
 - **Local whisper.cpp** transcription (`whisper-cli`, e.g. `large-v3-turbo`), tuned flags: `-l ja -t 24 -np -otxt`. Whisper's classic silence hallucinations (「ご視聴ありがとうございました」, 【音楽】 …) are filtered out instead of inserted.
 - **Inserts into the composer** through `ctx.screen.current()?.composer.insert(text)` — you review before sending. With no open session the text goes to the clipboard instead of being lost, and **"Voice Input: copy last transcription"** re-copies the latest take.
-- **Preferences** persisted server-side (`ctx.storage`, key `voice-input/prefs`): language (ja/en/auto), thread count, whisper binary path, model path, start/stop tones.
-- 300 s safety cap on a single recording; `Esc` or Cancel aborts without transcribing; failed attempts leave a visible warning pill with the error.
+- **Preferences** persisted server-side (`ctx.storage`, key `voice-input/prefs`): language (ja/en/auto), microphone (PipeWire capture source), thread count, whisper binary path, model path, start/stop tones.
+- 300 s safety cap on a single recording — the take is kept for **Retry** instead of being discarded; `Esc` or Cancel aborts without transcribing; failed attempts leave a visible warning pill with the error.
 - **Failures never lose your audio**: if whisper fails (bad model path, out of memory…), the WAV take is kept, the overlay shows a red *failed* state with the error and a **Retry** button (`Esc`/Discard drops it), and the pill turns into a retry shortcut — re-transcribe the exact same take without recording again.
+- **Pick the microphone in settings.** The recorder passes the chosen PipeWire node to `pw-record --target`; the level meter follows the same device when the browser exposes it. If it can't (PipeWire names are not always visible to Chromium), the meter says so and automatic silence-stop is disabled instead of listening to a different mic.
 
 ## Requirements (Ubuntu)
 
@@ -107,7 +108,9 @@ OpenCode Desktop に **完全ローカル** の音声入力を追加するプラ
 - 録音は PipeWire（`pw-record`）、文字起こしは **whisper.cpp**（例: large-v3-turbo）でローカル実行。クラウド STT は使いません。無音時の恒常的ハルシネーション（「ご視聴ありがとうございました」等）は除去します。
 - 認識結果は即送信せず **composer に挿入**されるため、必ず内容を確認してから送信できます。セッション未表示時はクリップボードへ退避。「直前の文字起こしをコピー」コマンドで再コピーも可能。
 - **文字起こし失敗時も録音音声は破棄せず保持**。オーバーレイにエラー内容と**再試行**ボタン（`Esc`/破棄で削除）、ピルも再試行ショートカットに変化 — 録り直しなしで同じ音声から再文字起こしできます。
-- 言語（ja/en/auto）・スレッド数・whisper のバイナリ/モデルパス・ビープ音は設定パネルから変更でき、サーバー側に保存されます。失敗原因是 idle ピルの警告タイトルに表示されます。
+- 言語（ja/en/auto）・**マイク（PipeWire入力デバイス）**・スレッド数・whisper のバイナリ/モデルパス・ビープ音は設定パネルから変更でき、サーバー側に保存されます。失敗原因はピルの警告タイトルに表示されます。
+- 入力デバイスを変更すると `pw-record --target` にそのノード名が渡されます。レベルメーターも同じデバイスを追従しますが、Chromium から PipeWire のノードが見えない場合は「別マイクを聴いて誤停止する」ことを避けるため、自動無音停止をオフにしてその旨を表示します（手動停止は可能）。
+- 300秒の上限に達した録音も破棄せず保持し、**再試行**で文字起こしできます。
 
 前提: Ubuntu + PipeWire + whisper.cpp（非root導入手順は上の Requirements 参照）。xrdp ではオーディオリダイレクト有効時に `xrdp-source`/`xrdp-sink` がマイク／スピーカーとして使えます（`wpctl set-default` で既定に）。
 

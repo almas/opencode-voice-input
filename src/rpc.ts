@@ -77,6 +77,29 @@ export const VoiceInputRpc = {
         required: ["recording"],
       },
     },
+    // Available PipeWire capture sources, for the settings picker.
+    sources: {
+      input: { type: "object", properties: {} },
+      output: {
+        type: "object",
+        properties: {
+          sources: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "number" },
+                name: { type: "string" },
+                description: { type: "string" },
+                default: { type: "boolean" },
+              },
+              required: ["id", "name"],
+            },
+          },
+        },
+        required: ["sources"],
+      },
+    },
     // User preferences.
     prefs: {
       input: { type: "object", properties: {} },
@@ -87,9 +110,10 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          source: { type: "string" },
           beeps: { type: "boolean" },
         },
-        required: ["lang", "threads", "whisperBin", "model", "beeps"],
+        required: ["lang", "threads", "whisperBin", "model", "source", "beeps"],
       },
     },
     setPrefs: {
@@ -100,6 +124,7 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          source: { type: "string" },
           beeps: { type: "boolean" },
         },
       },
@@ -110,16 +135,19 @@ export const VoiceInputRpc = {
           threads: { type: "number" },
           whisperBin: { type: "string" },
           model: { type: "string" },
+          source: { type: "string" },
           beeps: { type: "boolean" },
         },
-        required: ["lang", "threads", "whisperBin", "model", "beeps"],
+        required: ["lang", "threads", "whisperBin", "model", "source", "beeps"],
       },
     },
   },
   events: {},
 } satisfies Rpc.PortableDefinition
 
-export type Prefs = { lang: string; threads: number; whisperBin: string; model: string; beeps: boolean }
+export type Prefs = { lang: string; threads: number; whisperBin: string; model: string; source: string; beeps: boolean }
+export type SourceInfo = { id: number; name: string; description: string; default: boolean }
+export type SourcesResult = { sources: SourceInfo[] }
 export type StartResult = { recording: boolean; startedAt: number }
 export type StopResult = { text: string; seconds: number }
 export type StatusResult = { recording: boolean; seconds: number; lastError: string; hasLastTake: boolean }

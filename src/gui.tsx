@@ -7,7 +7,7 @@
  * pill or header button, the palette command (mod+shift+m), and silence-based
  * auto-stop so one click is enough for a hands-free take.
  */
-import { Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js"
+import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js"
 import { Portal } from "solid-js/web"
 import {
   Command,
@@ -17,7 +17,7 @@ import {
   Slot,
   type MountedSession,
 } from "@opencode/plugin/gui"
-import { VoiceInputRpc, type Prefs, type StartResult, type StatusResult, type StopResult } from "./rpc"
+import { VoiceInputRpc, type Prefs, type SourceInfo, type SourcesResult, type StartResult, type StatusResult, type StopResult } from "./rpc"
 
 /** The host components we use; the public types keep the registry open, so we type the calls. */
 interface IconProps {
@@ -42,11 +42,12 @@ interface RpcLike {
   discardTake(): Promise<unknown>
   cancel(): Promise<unknown>
   status(): Promise<unknown>
+  sources(): Promise<unknown>
   prefs(): Promise<unknown>
   setPrefs(input: Partial<Prefs>): Promise<unknown>
 }
 
-const DEFAULT_PREFS: Prefs = { lang: "ja", threads: 24, whisperBin: "whisper-cli", model: "", beeps: true }
+const DEFAULT_PREFS: Prefs = { lang: "ja", threads: 24, whisperBin: "whisper-cli", model: "", source: "", beeps: true }
 
 /** RMS above which we count the meter as "someone is speaking". */
 const SPEAK_THRESHOLD = 0.012
@@ -169,6 +170,8 @@ export default Plugin.define({
       "voice-input.overlay.hint": "Click Stop, press the shortcut again, or stay silent to finish",
       "voice-input.overlay.noAudio": "No audio from the mic — check the mic itself and RDP mic redirection",
       "voice-input.overlay.noMeter": "Level meter unavailable (app mic access denied) — use Stop manually",
+      "voice-input.overlay.meterOther":
+        "The level meter only follows the system default mic, so silence auto-stop is off for this device — press Stop yourself",
       "voice-input.overlay.stop": "Stop & transcribe",
       "voice-input.overlay.cancel": "Cancel",
       "voice-input.overlay.autoCancelled": "No audio detected; recording cancelled",
@@ -190,6 +193,9 @@ export default Plugin.define({
       "voice-input.no-session": "Open a session to insert dictated text.",
       "voice-input.settings.title": "Voice Input",
       "voice-input.settings.lang": "Recognition language (ISO code, e.g. ja)",
+      "voice-input.settings.source": "Microphone (capture source)",
+      "voice-input.settings.sourceDefault": "System default",
+      "voice-input.settings.sourceNone": "No capture sources found — check PipeWire",
       "voice-input.settings.threads": "whisper threads",
       "voice-input.settings.bin": "whisper-cli path",
       "voice-input.settings.model": "whisper model path",
@@ -212,6 +218,8 @@ export default Plugin.define({
       "voice-input.overlay.hint": "停止ボタン・ショートカット・無音で自動終了",
       "voice-input.overlay.noAudio": "マイク音声が検出できません — マイク本体とRDPのマイクリダイレクション設定を確認してください",
       "voice-input.overlay.noMeter": "レベル表示不可（アプリのマイク権限なし）— 停止は手動でお願いします",
+      "voice-input.overlay.meterOther":
+        "レベル表示はシステム既定のマイクのみ対応のため、このデバイスでは無音の自動停止をオフにしています — 手動で停止してください",
       "voice-input.overlay.stop": "停止して文字起こし",
       "voice-input.overlay.cancel": "中止",
       "voice-input.overlay.autoCancelled": "音声が検出されなかったため録音を中止しました",
@@ -233,6 +241,9 @@ export default Plugin.define({
       "voice-input.no-session": "セッションを開くと、文字起こし結果を挿入できます。",
       "voice-input.settings.title": "音声入力",
       "voice-input.settings.lang": "認識言語（ISOコード、例: ja）",
+      "voice-input.settings.source": "マイク（入力デバイス）",
+      "voice-input.settings.sourceDefault": "システム既定",
+      "voice-input.settings.sourceNone": "入力デバイスが見つかりません（PipeWireを確認してください）",
       "voice-input.settings.threads": "whisperスレッド数",
       "voice-input.settings.bin": "whisper-cliのパス",
       "voice-input.settings.model": "whisperモデルのパス",
@@ -301,6 +312,7 @@ export default Plugin.define({
     // ---------- live level meter (client-side, optional) ----------
     const [level, setLevel] = createSignal(0)
     const [meterAvailable, setMeterAvailable] = createSignal(false)
+    const [meterOther, setMeterOther] = createSignal(false)
     const [noAudio, setNoAudio] = createSignal(false)
     let meterStop: (() => void) | undefined
 
@@ -309,16 +321,50 @@ export default Plugin.define({
       meterStop = undefined
       setLevel(0)
       setNoAudio(false)
+      setMeterOther(false)
     }
 
     const startMeter = async (onSilence: () => void, onNoAudio: () => void) => {
       stopMeter()
       let stream: MediaStream | undefined
+      // The recorder honours the picked PipeWire node; the browser meter can
+      // only follow a device it knows. Watch the same mic when possible, and
+      // otherwise leave auto-stop off rather than listening to another one.
+      let constraint: MediaTrackConstraints = { channelCount: 1, echoCancellation: true, noiseSuppression: true }
+      const wanted = prefs().source
+      if (wanted !== "") {
+        try {
+          const [sourceList, devices] = await Promise.all([
+            rpc.sources() as Promise<SourcesResult>,
+            navigator.mediaDevices.enumerateDevices(),
+          ])
+          const info = sourceList.sources.find((entry) => entry.name === wanted)
+          const match = info
+            ? devices.find(
+                (device) =>
+                  device.kind === "audioinput" &&
+                  device.label !== "" &&
+                  (device.label === info.description || device.label.includes(info.description)),
+              )
+            : undefined
+          if (match?.deviceId) {
+            constraint = { ...constraint, deviceId: { exact: match.deviceId } }
+          } else {
+            console.warn("[voice-input] meter cannot follow the selected source; auto-stop disabled")
+            setMeterOther(true)
+            setMeterAvailable(false)
+            return
+          }
+        } catch (error) {
+          console.warn(`[voice-input] meter source lookup failed: ${errorText(error)}`)
+          setMeterOther(true)
+          setMeterAvailable(false)
+          return
+        }
+      }
       try {
         if (!navigator.mediaDevices?.getUserMedia) return
-        stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-        })
+        stream = await navigator.mediaDevices.getUserMedia({ audio: constraint })
       } catch (error) {
         console.warn(`[voice-input] mic level meter unavailable: ${errorText(error)}`)
         setMeterAvailable(false)
@@ -835,7 +881,7 @@ export default Plugin.define({
                   <div style={{ opacity: "0.65" }}>
                     <Show when={!noAudio()} fallback={<span style={{ color: "#e5484d" }}>{ctx.t("voice-input.overlay.noAudio")}</span>}>
                       {ctx.t("voice-input.overlay.hint")}
-                      <Show when={!meterAvailable()}> · {ctx.t("voice-input.overlay.noMeter")}</Show>
+                      <Show when={!meterAvailable()}> · {meterOther() ? ctx.t("voice-input.overlay.meterOther") : ctx.t("voice-input.overlay.noMeter")}</Show>
                     </Show>
                   </div>
                 </Show>
@@ -881,6 +927,18 @@ export default Plugin.define({
     })
 
     function SettingsView() {
+      const [sources, setSources] = createSignal<SourceInfo[]>([])
+      const [sourcesLoaded, setSourcesLoaded] = createSignal(false)
+      onMount(() => {
+        void rpc
+          .sources()
+          .then((value) => {
+            const result = value as SourcesResult
+            setSources(Array.isArray(result?.sources) ? result.sources : [])
+            setSourcesLoaded(true)
+          })
+          .catch(() => setSourcesLoaded(true))
+      })
       const fieldStyle = { padding: "4px 8px", "min-width": "320px", "max-width": "480px" }
       const labelStyle = { display: "flex", "flex-direction": "column", gap: "6px" } as const
       return (
@@ -896,6 +954,27 @@ export default Plugin.define({
               <option value="en">en（英語）</option>
               <option value="auto">auto（自動検出）</option>
             </select>
+          </label>
+          <label style={labelStyle}>
+            <span>{ctx.t("voice-input.settings.source")}</span>
+            <select
+              value={prefs().source}
+              onChange={(event) => void savePrefs({ source: event.currentTarget.value })}
+              style={{ "align-self": "flex-start", padding: "4px 8px", "max-width": "480px" }}
+            >
+              <option value="">{ctx.t("voice-input.settings.sourceDefault")}</option>
+              <For each={sources()}>
+                {(source) => (
+                  <option value={source.name}>
+                    {source.description}
+                    {source.default ? " ★" : ""}
+                  </option>
+                )}
+              </For>
+            </select>
+            <Show when={sourcesLoaded() && sources().length === 0}>
+              <span style={{ opacity: "0.65" }}>{ctx.t("voice-input.settings.sourceNone")}</span>
+            </Show>
           </label>
           <label style={labelStyle}>
             <span>

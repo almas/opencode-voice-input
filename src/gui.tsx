@@ -688,13 +688,37 @@ export default Plugin.define({
     // The microphone glyph is the module-level MIC_SVG, shared with the
     // header button so both controls look identical.
     onMount(() => {
+      const MIC_SELECTOR = 'button[data-oc-voice-mic="1"]'
       const syncMic = () => {
-        for (const submit of Array.from(
+        const found = Array.from(
           document.querySelectorAll<HTMLElement>('[data-action="composer-submit"]'),
-        )) {
+        )
+        // Treat the innermost node as the real submit button when a wrapper
+        // and the button itself both carry the attribute.
+        const submits = found.filter((el) => !found.some((other) => other !== el && el.contains(other)))
+
+        // One mic per composer footer, at most.
+        const footers = new Map<HTMLElement, HTMLElement>()
+        for (const submit of submits) {
           const footer = submit.parentElement
-          if (!footer) continue
-          let button = footer.querySelector<HTMLButtonElement>('button[data-oc-voice-mic="1"]')
+          if (footer && !footers.has(footer)) footers.set(footer, submit)
+        }
+
+        // Prune mics whose footer lost its submit button (the host rebuilt the
+        // composer) and any extras that slipped into the same footer; this is
+        // what used to leave two mic buttons beside send.
+        const kept = new Set<HTMLElement>()
+        for (const mic of Array.from(document.querySelectorAll<HTMLButtonElement>(MIC_SELECTOR))) {
+          const host = mic.parentElement
+          if (!host || !footers.has(host) || kept.has(host)) {
+            mic.remove()
+            continue
+          }
+          kept.add(host)
+        }
+
+        for (const [footer, submit] of footers) {
+          let button = footer.querySelector<HTMLButtonElement>(MIC_SELECTOR)
           if (!button) {
             button = document.createElement("button")
             button.type = "button"

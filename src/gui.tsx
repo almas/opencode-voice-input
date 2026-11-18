@@ -1,17 +1,18 @@
 /**
  * Voice Input — the GUI half of the plugin.
  *
- * Visibility first: a pill above the composer shows the recorder state at all
- * times, a floating overlay with a live level meter and timer runs while
- * recording, and whisper transcription has its own busy state. Triggers: the
- * pill or header button, the palette command (mod+shift+m), and silence-based
- * auto-stop so one click is enough for a hands-free take.
+ * Visibility first: a small mic icon button sits right beside the composer's
+ * send button, a floating overlay with a live level meter and timer runs while
+ * recording, and transcription shows a partial caption that grows as it goes —
+ * whisper segments are transcribed concurrently with the recording, so the
+ * final text arrives almost instantly after you stop. Triggers: the mic
+ * button or the header button, the palette command (mod+shift+m), and
+ * silence-based auto-stop so one click is enough for a hands-free take.
  */
 import { For, Show, createEffect, createSignal, onCleanup, onMount, type JSX } from "solid-js"
 import { Portal } from "solid-js/web"
 import {
   Command,
-  ComposerPill,
   Plugin,
   SettingsPage,
   Slot,
@@ -71,6 +72,9 @@ function injectStyles() {
 @keyframes vi-spin { to { transform: rotate(360deg) } }
 @keyframes vi-eq { 0%, 100% { transform: scaleY(0.25) } 50% { transform: scaleY(1) } }
 .vi-eq-bar { transform-origin: bottom; animation: vi-eq 900ms ease-in-out infinite }
+@keyframes vi-mic-pulse { 0%, 100% { opacity: 1 } 50% { opacity: 0.35 } }
+button[data-oc-voice-mic="1"] svg { width: 16px; height: 16px }
+button[data-oc-voice-mic="1"][data-recording="1"] { animation: vi-mic-pulse 1.2s ease-in-out infinite; color: #e5484d }
 `
   document.head.appendChild(style)
 }
@@ -278,6 +282,7 @@ export default Plugin.define({
     const [state, setState] = createSignal<"idle" | "recording" | "busy" | "failed">("idle")
     const [elapsed, setElapsed] = createSignal(0)
     const [lastError, setLastError] = createSignal<string>()
+    const [partial, setPartial] = createSignal("")
     const ticker = setInterval(() => {
       if (state() !== "recording" || finishing) return
       void rpc
@@ -288,11 +293,15 @@ export default Plugin.define({
             // The take ended elsewhere (another window, or the recorder died): reflect it here.
             setState("idle")
             setElapsed(0)
+            setPartial("")
             stopMeter()
             if (status.lastError) setLastError(status.lastError)
             return
           }
           setElapsed(status.recording ? Math.floor(status.seconds) : 0)
+          // Live caption: the server transcribes segments while we record.
+          const caption = status.partial ?? status.partialStable
+          if (caption !== undefined) setPartial(caption)
         })
         .catch(() => {})
     }, 1000)
@@ -478,6 +487,7 @@ export default Plugin.define({
           setLastError(undefined)
           setState("recording")
           setElapsed(0)
+          setPartial("")
           void startMeter(
             () => {
               // Silence after speech: finish the take.
@@ -657,55 +667,92 @@ export default Plugin.define({
       run: () => void copyLast(),
     })
 
-    // ---------- composer pill: always-visible state ----------
-    ctx.add(ComposerPill, {
-      id: "voice-input",
-      order: 5,
-      show: () => {
-        const current = state()
-        if (current === "recording") {
-          return {
-            icon: "stop" as const,
-            tone: "danger" as const,
-            label: `${ctx.t("voice-input.pill.recording")} ${formatClock(elapsed())}`,
-            title: ctx.t("voice-input.action.stop"),
-            run: toggle,
+    // ---------- composer control: a mic icon beside send ----------
+    // The host icon dictionary has no microphone glyph and a declarative pill
+    // cannot host a custom SVG, so this is a host-styled icon button injected
+    // as the send button's sibling — the same DOM approach the tts plugin uses
+    // for its per-message buttons. It copies the submit button's own classes,
+    // so it matches both the tall and the compact composer footers, and shows
+    // a red stop square (pulsing) while recording.
+    const MIC_SVG =
+      '<svg viewBox="0 0 14 14" fill="none" aria-hidden="true">' +
+      '<path d="M7 8.75a2.5 2.5 0 0 0 2.5-2.5V3a2.5 2.5 0 1 0-5 0v3.25A2.5 2.5 0 0 0 7 8.75Z" stroke="currentColor" stroke-width="1.1"/>' +
+      '<path d="M3.4 6.5v.25a3.6 3.6 0 0 0 7.2 0V6.5M7 10.35v1.4M5.1 11.95h3.8" stroke="currentColor" stroke-width="1.1" stroke-linecap="round"/>' +
+      "</svg>"
+    const STOP_SVG = '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M13 3H3V13H13V3Z" fill="currentColor"/></svg>'
+
+    onMount(() => {
+      const syncMic = () => {
+        for (const submit of Array.from(
+          document.querySelectorAll<HTMLElement>('[data-action="composer-submit"]'),
+        )) {
+          const footer = submit.parentElement
+          if (!footer) continue
+          let button = footer.querySelector<HTMLButtonElement>('button[data-oc-voice-mic="1"]')
+          if (!button) {
+            button = document.createElement("button")
+            button.type = "button"
+            button.dataset.ocVoiceMic = "1"
+            button.className = submit.className
+            button.style.flex = "none"
+            if (submit.className.includes("size-7")) {
+              // Compact composer: shrink below the copied tall-button classes.
+              button.style.width = "28px"
+              button.style.height = "28px"
+              button.style.padding = "4px"
+              button.style.borderRadius = "6px"
+            }
+            footer.insertBefore(button, submit)
+          }
+          if (button.nextElementSibling !== submit) footer.insertBefore(button, submit)
+          const recording = state() === "recording"
+          const icon = recording ? STOP_SVG : MIC_SVG
+          if (button.dataset.icon !== icon) {
+            button.dataset.icon = icon
+            button.innerHTML = icon
+          }
+          button.dataset.recording = recording ? "1" : "0"
+          const title = recording
+            ? `${ctx.t("voice-input.action.stop")} ${formatClock(elapsed())}`
+            : state() === "busy"
+              ? ctx.t("voice-input.pill.busy")
+              : state() === "failed"
+                ? lastError() || ctx.t("voice-input.action.retry")
+                : ctx.t("voice-input.action.start")
+          if (button.title !== title) {
+            button.title = title
+            button.setAttribute("aria-label", title)
           }
         }
-        if (current === "busy") {
-          return {
-            icon: "refresh" as const,
-            tone: "warning" as const,
-            label: ctx.t("voice-input.pill.busy"),
-            title: ctx.t("voice-input.action.busy"),
-          }
-        }
-        if (current === "failed") {
-          return {
-            icon: "refresh" as const,
-            tone: "danger" as const,
-            label: ctx.t("voice-input.pill.failed"),
-            title: lastError() || ctx.t("voice-input.action.retry"),
-            run: toggle,
-          }
-        }
-        const failure = lastError()
-        if (failure) {
-          return {
-            icon: "outline-wave-audio" as const,
-            tone: "warning" as const,
-            label: ctx.t("voice-input.pill.error"),
-            title: failure,
-            run: toggle,
-          }
-        }
-        return {
-          icon: "outline-wave-audio" as const,
-          label: ctx.t("voice-input.pill.idle"),
-          title: ctx.t("voice-input.action.start"),
-          run: toggle,
-        }
-      },
+      }
+
+      let queued = false
+      const observer = new MutationObserver(() => {
+        if (queued) return
+        queued = true
+        queueMicrotask(() => {
+          queued = false
+          syncMic()
+        })
+      })
+      observer.observe(document.body, { childList: true, subtree: true })
+      const clock = window.setInterval(syncMic, 1000)
+      const onClick = (event: MouseEvent) => {
+        const target = event.target as HTMLElement | null
+        if (!target?.closest?.('button[data-oc-voice-mic="1"]')) return
+        event.preventDefault()
+        event.stopPropagation()
+        void toggle()
+      }
+      window.addEventListener("click", onClick, true)
+      syncMic()
+      onCleanup(() => {
+        observer.disconnect()
+        window.clearInterval(clock)
+        window.removeEventListener("click", onClick, true)
+        for (const button of Array.from(document.querySelectorAll('button[data-oc-voice-mic="1"]')))
+          button.remove()
+      })
     })
 
     // ---------- header button ----------
@@ -862,6 +909,22 @@ export default Plugin.define({
                     <span style={{ "font-weight": "600", color: "#e5484d" }}>{ctx.t("voice-input.overlay.failed")}</span>
                   </Show>
                 </div>
+                <Show when={partial()}>
+                  <div
+                    style={{
+                      "margin-top": "2px",
+                      "max-width": "460px",
+                      "font-size": "12px",
+                      opacity: "0.75",
+                      display: "-webkit-box",
+                      "-webkit-line-clamp": "3",
+                      "-webkit-box-orient": "vertical",
+                      overflow: "hidden",
+                    }}
+                  >
+                    {partial()}
+                  </div>
+                </Show>
                 <Show when={state() === "recording"}>
                   <div style={{ display: "flex", gap: "8px" }}>
                     <button

@@ -8,7 +8,7 @@
  */
 import { execFile } from "node:child_process"
 import { spawn, type ChildProcessByStdio } from "node:child_process"
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync } from "node:fs"
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import type { Readable } from "node:stream"
@@ -75,6 +75,192 @@ interface Active {
   stderr: string
   stopping: boolean
   timer: ReturnType<typeof setTimeout>
+  worker?: SegmentWorker
+}
+
+/** Segment length for recording-time transcription (16 kHz mono s16 = 32 kB/s). */
+const SEGMENT_BYTES = 16_000 * 2 * 8
+/** Only re-transcribe the pending tail once it reaches ~2 s of audio. */
+const MIN_TAIL_BYTES = 16_000 * 2 * 2
+const BYTES_PER_SAMPLE = 2
+
+/** Byte offset where the s16 samples start in a pw-record wav (44 for canonical headers). */
+export function findWavDataOffset(buf: Buffer): number {
+  for (let i = 12; i + 8 <= buf.length; ) {
+    const id = buf.toString("latin1", i, i + 4)
+    const size = buf.readUInt32LE(i + 4)
+    if (id === "data") return i + 8
+    if (size > 0x1000_0000) break
+    i += 8 + size + (size % 2)
+  }
+  return 44
+}
+
+/** Transcribe one slice; -sns keeps short slices free of invented noise tags. */
+function runSegment(wav: string, prefs: Prefs): Promise<string> {
+  return transcribe(wav, prefs, ["-sns"])
+}
+
+/** Read `from`..`to` bytes of PCM samples, counted from the start of the data chunk. */
+export function readWavSlice(file: string, from: number, to: number): Buffer {
+  const whole = readFileSync(file)
+  const dataOffset = findWavDataOffset(whole)
+  const start = Math.min(whole.length, dataOffset + from)
+  const end = Math.min(whole.length, dataOffset + to)
+  if (end <= start) return Buffer.alloc(0)
+  return whole.subarray(start, end)
+}
+
+export function encodeWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
+  const header = Buffer.alloc(44)
+  header.write("RIFF", 0)
+  header.writeUInt32LE(36 + pcm.length, 4)
+  header.write("WAVE", 8)
+  header.write("fmt ", 12)
+  header.writeUInt32LE(16, 16)
+  header.writeUInt16LE(1, 20)
+  header.writeUInt16LE(channels, 22)
+  header.writeUInt32LE(sampleRate, 24)
+  header.writeUInt32LE((sampleRate * channels * 2) | 0, 28)
+  header.writeUInt16LE(channels * 2, 32)
+  header.writeUInt16LE(16, 34)
+  header.write("data", 36)
+  header.writeUInt32LE(pcm.length, 40)
+  return Buffer.concat([header, pcm])
+}
+
+export function joinJa(a: string, b: string): string {
+  if (!a.trim()) return b.trim()
+  if (!b.trim()) return a.trim()
+  return `${a.trim()} ${b.trim()}`
+}
+
+/**
+ * Streams transcription while you speak.
+ *
+ * pw-record keeps writing the wav for the whole take, so the worker slices the
+ * bytes recorded so far into segments and runs whisper-cli on each one in a
+ * queue, in order. When you stop, only the tail slice is left to process,
+ * which removes the wait for re-transcribing the whole take. A slice error
+ * never loses the take: the final pass still runs on the complete wav.
+ */
+class SegmentWorker {
+  private stable = ""
+  private tentative = ""
+  private cursor = 0
+  private started = new Set<number>()
+  private queue: Promise<void> = Promise.resolve()
+  private lastSize = -1
+  private stopped = false
+
+  constructor(
+    private readonly file: string,
+    private readonly prefs: () => Promise<Prefs>,
+  ) {}
+
+  get stableText(): string {
+    return this.stable
+  }
+
+  /** Live caption: completed segments plus the tentative tail pass. */
+  get caption(): string {
+    return joinJa(this.stable, this.tentative)
+  }
+
+  /** Called by the status poller: transcribe any newly recorded audio. */
+  async progress(): Promise<void> {
+    if (this.stopped) return
+    let size = 0
+    try {
+      size = statSync(this.file).size
+    } catch {
+      return
+    }
+    const body = Math.max(0, size - 44)
+    if (body === this.lastSize) return
+    this.lastSize = body
+    const start = Math.floor(this.cursor / BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+    const end = Math.floor(body / BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+    // Keep a partial for the audio that full segments do not cover yet.
+    if (end - start >= MIN_TAIL_BYTES) {
+      const from = Math.max(start, end - SEGMENT_BYTES)
+      this.enqueue(from, end, true)
+    }
+    while (this.cursor + SEGMENT_BYTES <= end) {
+      const to = this.cursor + SEGMENT_BYTES
+      this.enqueue(this.cursor, to, false)
+      this.cursor = to
+    }
+  }
+
+  /** Stop recording-time work, process the tail, and return the full text. */
+  async finish(): Promise<string> {
+    this.stopped = true
+    await this.progress()
+    this.queue = this.queue.then(async () => {
+      let size = 0
+      try {
+        size = statSync(this.file).size
+      } catch {}
+      const body = Math.max(0, size - 44)
+      const end = Math.floor(body / BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+      const start = Math.floor(this.cursor / BYTES_PER_SAMPLE) * BYTES_PER_SAMPLE
+      if (end - start >= MIN_AUDIO_BYTES) {
+        try {
+          this.tentative = await this.run(start, end, false)
+        } catch {
+          this.tentative = ""
+        }
+      }
+      this.stable = joinJa(this.stable, this.tentative)
+      this.tentative = ""
+    })
+    await this.queue
+    return joinJa(this.stable, this.tentative)
+  }
+
+  kill(): void {
+    this.stopped = true
+  }
+
+  private enqueue(from: number, to: number, tentative: boolean): void {
+    if (this.stopped) return
+    const key = tentative ? -1 : from
+    if (this.started.has(key)) return
+    this.started.add(key)
+    if (!tentative) for (const other of [...this.started]) if (other >= 0 && other < from) this.started.delete(other)
+    this.queue = this.queue.then(async () => {
+      if (this.stopped && tentative) return
+      const text = await this.run(from, to, tentative)
+      if (tentative) this.tentative = text
+      else {
+        this.stable = joinJa(this.stable, text)
+        this.tentative = ""
+      }
+    })
+  }
+
+  private async run(from: number, to: number, tentative: boolean): Promise<string> {
+    const prefs = await this.prefs()
+    const slice = join(dirname(this.file), `seg-${tentative ? "tail" : from}.wav`)
+    try {
+      const pcm = readWavSlice(this.file, from, to)
+      if (!pcm || pcm.length < MIN_AUDIO_BYTES) return ""
+      writeFileSync(slice, encodeWav(pcm, 16_000, 1))
+      let text = await runSegment(slice, prefs)
+      if (!text && tentative) text = stripSilenceHallucinations(await transcribe(this.file, prefs))
+      return text
+    } catch (error) {
+      // A slice that fails must not break the queue; stop()'s final pass on
+      // the complete wav still covers everything the slice missed.
+      if (tentative) return ""
+      throw error
+    } finally {
+      try {
+        unlinkSync(slice)
+      } catch {}
+    }
+  }
 }
 
 let active: Active | undefined
@@ -162,7 +348,7 @@ export function stripSilenceHallucinations(text: string): string {
     .trim()
 }
 
-function transcribe(wav: string, prefs: Prefs): Promise<string> {
+function transcribe(wav: string, prefs: Prefs, extraArgs: string[] = []): Promise<string> {
   return new Promise((resolve, reject) => {
     if (prefs.model !== "" && !existsSync(prefs.model)) {
       reject(new Error(`whisperモデルが見つかりません: ${prefs.model}`))
@@ -173,7 +359,7 @@ function transcribe(wav: string, prefs: Prefs): Promise<string> {
     env.LD_LIBRARY_PATH = env.LD_LIBRARY_PATH ? `${LIB_DIR}:${env.LD_LIBRARY_PATH}` : LIB_DIR
     const child = spawn(
       prefs.whisperBin,
-      ["-m", prefs.model, "-f", wav, "-l", prefs.lang, "-t", String(prefs.threads), "-np", "-otxt", "-of", out],
+      ["-m", prefs.model, "-f", wav, "-l", prefs.lang, "-t", String(prefs.threads), "-np", ...extraArgs, "-otxt", "-of", out],
       { env, stdio: ["ignore", "ignore", "pipe"] },
     )
     let err = ""
@@ -255,10 +441,12 @@ export default Plugin.define({
         startedAt: Date.now(),
         stderr: "",
         stopping: false,
+        worker: new SegmentWorker(file, load),
         timer: setTimeout(() => {
           if (active === rec && !rec.stopping) {
             rec.stopping = true
             active = undefined
+            rec.worker?.kill()
             void terminate(rec).then(() => {
               // Keep the long take instead of losing it: the GUI offers 再試行.
               if (lastTake) discardDirOf(lastTake.file)
@@ -285,6 +473,7 @@ export default Plugin.define({
       if (spawnError || child.exitCode !== null || child.signalCode !== null) {
         active = undefined
         clearTimeout(rec.timer)
+        rec.worker?.kill()
         discard(rec)
         throw new Error(
           spawnError
@@ -314,7 +503,18 @@ export default Plugin.define({
       }
       try {
         const prefs = await load()
-        const text = await transcribe(rec.file, prefs)
+        // Use the segments already transcribed during recording; only the
+        // tail is processed now. If the worker hit any trouble, fall back to
+        // one whisper pass over the whole wav so the take is never lost.
+        let text = ""
+        if (rec.worker) {
+          try {
+            text = await rec.worker.finish()
+          } catch {
+            text = ""
+          }
+        }
+        if (!text) text = await transcribe(rec.file, prefs)
         lastError = ""
         discard(rec)
         return { text, seconds }
@@ -359,6 +559,7 @@ export default Plugin.define({
       active = undefined
       rec.stopping = true
       clearTimeout(rec.timer)
+      rec.worker?.kill()
       await terminate(rec)
       discard(rec)
       return { cancelled: true }
@@ -409,12 +610,18 @@ export default Plugin.define({
       discardTake,
       cancel,
       sources: listSources,
-      status: async (): Promise<StatusResult> => ({
-        recording: active !== undefined,
-        seconds: active ? (Date.now() - active.startedAt) / 1000 : 0,
-        lastError,
-        hasLastTake: lastTake !== undefined,
-      }),
+      status: async (): Promise<StatusResult> => {
+        const worker = active?.worker
+        if (worker) await worker.progress().catch(() => {})
+        return {
+          recording: active !== undefined,
+          seconds: active ? (Date.now() - active.startedAt) / 1000 : 0,
+          lastError,
+          hasLastTake: lastTake !== undefined,
+          partial: active ? worker?.caption ?? "" : "",
+          partialStable: active ? worker?.stableText ?? "" : "",
+        }
+      },
       prefs: async () => await load(),
       setPrefs: async (raw) => {
         const input = (raw ?? {}) as Partial<Prefs>

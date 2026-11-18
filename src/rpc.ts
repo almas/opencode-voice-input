@@ -73,6 +73,8 @@ export const VoiceInputRpc = {
           seconds: { type: "number" },
           lastError: { type: "string" },
           hasLastTake: { type: "boolean" },
+          partial: { type: "string" },
+          partialStable: { type: "string" },
         },
         required: ["recording"],
       },
@@ -150,4 +152,12 @@ export type SourceInfo = { id: number; name: string; description: string; defaul
 export type SourcesResult = { sources: SourceInfo[] }
 export type StartResult = { recording: boolean; startedAt: number }
 export type StopResult = { text: string; seconds: number }
-export type StatusResult = { recording: boolean; seconds: number; lastError: string; hasLastTake: boolean }
+export type StatusResult = {
+  recording: boolean
+  seconds: number
+  lastError: string
+  hasLastTake: boolean
+  /** Transcribed-so-far text (segments completed while recording). */
+  partial?: string
+  partialStable?: string
+}
